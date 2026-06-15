@@ -1,0 +1,10 @@
+spring:
+  cloud:
+    nacos:
+      server-addr: 47.106.155.227:8848
+      config:
+        file-extension: yaml
+  application:
+    name: order-service
+server:
+  port: 8080
