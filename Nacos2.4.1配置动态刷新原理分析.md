@@ -17,6 +17,16 @@
 9. [完整时序图](#九完整时序图)
 10. [当前代码问题与修复](#十当前代码问题与修复)
 11. [核心机制总结](#十一核心机制总结)
+12. [流程图](#十二流程图)
+    - [12.1 整体架构图](#121-整体架构图)
+    - [12.2 启动与配置拉取流程](#122-启动与配置拉取流程)
+    - [12.3 gRPC 连接建立流程](#123-grpc-连接建立流程)
+    - [12.4 批量监听注册流程](#124-批量监听注册流程)
+    - [12.5 配置变更 Push 全流程](#125-配置变更-push-全流程)
+    - [12.6 客户端类调用关系图](#126-客户端类调用关系图)
+    - [12.7 服务端类调用关系图](#127-服务端类调用关系图)
+    - [12.8 MD5 生命周期状态图](#128-md5-生命周期状态图)
+    - [12.9 配置变更端到端数据流](#129-配置变更端到端数据流)
 
 ---
 
@@ -954,3 +964,478 @@ public class ConfigController {
 | Spring 刷新 | `NacosContextRefresher` → `RefreshScope` | 发布 `RefreshScopeRefreshedEvent`，重建 `@RefreshScope` Bean |
 | 兜底轮询 | `LongPollingRunnable` | 每 3 秒检查，防止 gRPC 断连导致不同步 |
 | 本地快照 | `LocalConfigInfoProcessor` | 服务端不可用时仍能读取上次配置 |
+
+---
+
+## 十二、流程图
+
+### 12.1 整体架构图
+
+```mermaid
+graph TB
+    subgraph Client["Nacos Client - order-service"]
+        CC["ConfigController / RefreshScope"]
+        NCR["NacosContextRefresher"]
+        CW["ClientWorker / 核心调度线程"]
+        CD["CacheData / 配置缓存 + MD5"]
+        RPC["ConfigRpcServerClient / gRPC通信"]
+        GC["GrpcClient / gRPC Channel管理"]
+        LP["LongPollingRunnable / 兜底轮询3s"]
+        SNAP["LocalConfigInfoProcessor / 本地快照"]
+    end
+
+    subgraph Server["Nacos Server"]
+        GA["GrpcBiStreamRequestAcceptor / gRPC入口"]
+        CBLH["ConfigChangeBatchListenRequestHandler"]
+        CQH["ConfigQueryRequestHandler"]
+        CLC["ConfigChangeListenContext / 监听注册表"]
+        CCS["ConfigCacheService / 内存缓存 + MD5"]
+        RCN["RpcConfigChangeNotifier / Push通知"]
+        DB["数据库 MySQL/Derby"]
+    end
+
+    CC -->|"Value注入"| NCR
+    NCR -->|"addListener"| CW
+    CW --> CD
+    CW --> RPC
+    CW --> LP
+    RPC --> GC
+    CD --> SNAP
+
+    GC -->|"gRPC双向流 port 9848"| GA
+    GA -->|"Push通知"| GC
+    GA --> CBLH
+    GA --> CQH
+    CBLH --> CLC
+    CBLH --> CCS
+    CQH --> CCS
+    CCS --> DB
+    CCS -->|"ConfigDataChangeEvent"| RCN
+    RCN -->|"查询监听连接"| CLC
+    RCN -->|"ConfigChangeNotifyRequest"| GC
+```
+
+### 12.2 启动与配置拉取流程
+
+```mermaid
+sequenceDiagram
+    participant SC as Spring Cloud<br/>Bootstrap Context
+    participant NPSL as NacosProperty<br/>SourceLocator
+    participant NCS as NacosConfig<br/>Service
+    participant CW as ClientWorker
+    participant HTTP as HTTP Agent
+    participant NS as Nacos Server<br/>(8848)
+
+    SC->>NPSL: locate(Environment)
+    NPSL->>NPSL: 读取 bootstrap.yaml<br/>dataId=order-service.yaml<br/>group=DEFAULT_GROUP
+    NPSL->>NCS: new NacosConfigService(properties)
+    NCS->>CW: new ClientWorker(agent, properties)
+    CW->>CW: 初始化 gRPC 客户端<br/>注册 ConfigChangeNotifyRequestHandler<br/>启动 LongPollingRunnable
+
+    NPSL->>NCS: getConfig(dataId, group, 3000)
+    NCS->>CW: getServerConfig(dataId, group, tenant, 3000)
+
+    CW->>CW: 先查本地快照<br/>LocalConfigInfoProcessor.getSnapshot()
+    alt 快照存在
+        CW-->>NCS: 返回快照内容
+    else 快照不存在
+        CW->>HTTP: httpGet("/v1/cs/configs")
+        HTTP->>NS: HTTP GET /v1/cs/configs<br/>?dataId=order-service.yaml&group=DEFAULT_GROUP
+        NS-->>HTTP: 配置内容 "username: zhangsan"
+        HTTP-->>CW: 配置内容
+        CW->>CW: 保存本地快照<br/>LocalConfigInfoProcessor.saveSnapshot()
+    end
+
+    CW-->>NCS: 配置内容
+    NCS-->>NPSL: 配置内容
+    NPSL->>NPSL: 包装为 NacosPropertySource
+    NPSL-->>SC: PropertySource
+    SC->>SC: 加入 Environment<br/>@Value("${username}") 可解析
+```
+
+### 12.3 gRPC 连接建立流程
+
+```mermaid
+sequenceDiagram
+    participant CW as ClientWorker
+    participant RPC as ConfigRpcServerClient
+    participant GC as GrpcClient
+    participant NS as Nacos Server<br/>(9848 gRPC)
+    participant GA as GrpcBiStream<br/>RequestAcceptor
+    participant CM as Connection<br/>Manager
+
+    CW->>RPC: start()
+    RPC->>GC: connectToServer(serverInfo)
+
+    GC->>GC: 获取 Server 列表<br/>gRPC端口 = HTTP端口 + 1000 = 9848
+
+    GC->>GC: 创建 NettyChannel<br/>NettyChannelBuilder.forAddress("127.0.0.1", 9848)
+
+    GC->>GC: 创建 Bi-directional Streaming Stub<br/>RequestGrpc.newStub(channel)
+
+    GC->>NS: stub.request(responseObserver)
+    Note over GC,NS: 建立 gRPC Bi-directional Stream
+
+    NS->>GA: 接收连接
+    GA->>CM: 创建 GrpcConnection<br/>绑定 connectionId
+
+    GC->>NS: ConnectionSetupRequest<br/>{clientVersion: "2.4.1", labels: {...}}
+    NS-->>GC: ConnectionSetupResponse
+
+    GC->>GC: 启动健康检查<br/>scheduleHealthCheck()
+    Note over GC,NS: ═══ gRPC 长连接建立完成 ═══<br/>双方可随时收发消息
+
+    GC-->>RPC: 连接就绪
+    RPC-->>CW: 就绪
+```
+
+### 12.4 批量监听注册流程
+
+```mermaid
+sequenceDiagram
+    participant NCR as NacosContext<br/>Refresher
+    participant CW as ClientWorker
+    participant CD as CacheData
+    participant RPC as ConfigRpcServerClient
+    participant NS as Nacos Server
+    participant CBLH as ConfigChangeBatch<br/>ListenRequestHandler
+    participant CLC as ConfigChange<br/>ListenContext
+    participant CCS as ConfigCache<br/>Service
+
+    NCR->>NCR: onApplicationEvent<br/>(ApplicationReadyEvent)
+    NCR->>CW: addListener(dataId, group, listener)
+
+    CW->>CD: cacheMap.computeIfAbsent(groupKey)<br/>创建 CacheData(md5=null)
+    CW->>CD: addListeners(listener)
+
+    CW->>CW: checkConfigListener()
+    CW->>CW: 遍历 cacheMap，构建<br/>ConfigBatchListenRequest
+    Note over CW: {listen: true, contexts: [<br/>  {dataId, group, md5: null}<br/>]}
+
+    CW->>RPC: request(ConfigBatchListenRequest)
+    RPC->>NS: gRPC Stream → Payload
+
+    NS->>CBLH: handle(request, meta)
+    CBLH->>CBLH: 遍历 configListenContexts
+
+    loop 每个配置
+        CBLH->>CLC: addListen(groupKey, md5, connectionId)
+        Note over CLC: 双向绑定:<br/>groupKey → connectionId<br/>connectionId → groupKey
+
+        CBLH->>CCS: isUptodate(groupKey, clientMd5)
+        CCS->>CCS: 比对服务端MD5 vs 客户端MD5
+        alt MD5 不同 (首次 md5=null)
+            CCS-->>CBLH: false (已变更)
+            CBLH->>CBLH: response.addChangeConfig(dataId, group)
+        else MD5 相同
+            CCS-->>CBLH: true (未变更)
+        end
+    end
+
+    CBLH-->>NS: ConfigChangeBatchListenResponse<br/>{changedConfigs: [...]}
+    NS-->>RPC: gRPC Stream → Payload
+    RPC-->>CW: ConfigChangeBatchListenResponse
+
+    alt 有变更的配置
+        CW->>CW: 对每个 changedConfig<br/>发 ConfigQueryRequest 拉取新内容
+        CW->>CD: setContent() + setMd5()
+    end
+```
+
+### 12.5 配置变更 Push 全流程
+
+```mermaid
+sequenceDiagram
+    participant User as 用户/Console
+    participant CC as ConfigController<br/>(Server HTTP)
+    participant CCS as ConfigCache<br/>Service
+    participant NC as NotifyCenter
+    participant RCN as RpcConfigChange<br/>Notifier
+    participant CLC as ConfigChange<br/>ListenContext
+    participant Conn as gRPC Connection
+    participant GC as GrpcClient<br/>(Client)
+    participant CNH as ConfigChangeNotify<br/>RequestHandler
+    participant CW as ClientWorker
+    participant CD as CacheData
+    participant NCR as NacosContext<br/>Refresher
+    participant RS as RefreshScope
+    participant Bean as ConfigController<br/>(Client @RefreshScope)
+
+    User->>CC: POST /v1/cs/configs<br/>修改 username=lisi
+    CC->>CC: 持久化到数据库
+    CC->>CCS: dump(dataId, group, content)
+
+    CCS->>CCS: 更新内存缓存<br/>重新计算 MD5="d4e5f6..."
+    CCS->>NC: publishEvent(<br/>ConfigDataChangeEvent)
+
+    NC->>RCN: onEvent(event)
+    RCN->>CLC: getListeners(groupKey)
+    CLC-->>RCN: [connectionId_1, connectionId_2, ...]
+
+    loop 每个监听连接
+        RCN->>RCN: 构造 ConfigChangeNotifyRequest<br/>{dataId, group, tenant}
+        RCN->>Conn: sendResponse(payload)
+        Conn-->>GC: gRPC Stream → Payload
+    end
+
+    GC->>GC: responseObserver.onNext(payload)
+    GC->>GC: 解析 Request 类型<br/>→ ConfigChangeNotifyRequest
+    GC->>CNH: handle(request, connection)
+
+    CNH->>CD: getCache(groupKey)
+    CNH->>CD: setConsistentWithServer(false)
+    CNH->>CW: refreshContentAndCheck(dataId, group, tenant)
+
+    CW->>CW: 构建 ConfigQueryRequest<br/>{dataId, group, tag: null}
+    CW->>GC: request(ConfigQueryRequest)
+    GC->>Conn: gRPC Stream → Payload
+
+    Note over Conn,CCS: 服务端处理 ConfigQueryRequest<br/>返回最新配置内容
+
+    Conn-->>GC: ConfigQueryResponse<br/>{content: "username: lisi", md5: "d4e5f6..."}
+
+    GC-->>CW: ConfigQueryResponse
+    CW->>CD: setContent("username: lisi")
+    CW->>CD: setMd5("d4e5f6...")
+    CW->>CW: 保存本地快照
+
+    CW->>CD: checkListenerMd5()
+    CD->>CD: oldMd5("a1b2c3") != newMd5("d4e5f6")
+    CD->>NCR: listener.receiveConfigInfo("username: lisi")
+
+    NCR->>NCR: 更新 NacosPropertySource
+    NCR->>RS: publishEvent(<br/>RefreshScopeRefreshedEvent)
+
+    RS->>RS: super.destroy()<br/>清空 Bean 缓存
+
+    Note over Bean: 下次 HTTP 请求 /demo 时
+    Bean->>Bean: 重新创建 Bean<br/>@Value("${username}")<br/>从 Environment 读取 → "lisi"
+```
+
+### 12.6 客户端类调用关系图
+
+```mermaid
+graph TD
+    subgraph "Spring Cloud 集成层"
+        NPSL["NacosPropertySourceLocator<br/>Bootstrap阶段拉取配置"]
+        NCR2["NacosContextRefresher<br/>注册Listener + 触发RefreshScope"]
+        NCP["NacosConfigProperties<br/>配置属性绑定"]
+    end
+
+    subgraph "Nacos Client 核心层"
+        NCS2["NacosConfigService<br/>配置服务入口"]
+        CW2["ClientWorker<br/>核心调度线程"]
+        CD2["CacheData<br/>配置缓存 + MD5"]
+        LP2["LongPollingRunnable<br/>兜底轮询(3s)"]
+    end
+
+    subgraph "gRPC 通信层"
+        RPC2["ConfigRpcServerClient<br/>gRPC配置客户端"]
+        GC2["GrpcClient<br/>gRPC Channel管理"]
+        CNH2["ConfigChangeNotifyRequestHandler<br/>处理服务端Push"]
+    end
+
+    subgraph "本地存储"
+        SNAP2["LocalConfigInfoProcessor<br/>本地快照文件"]
+    end
+
+    NPSL -->|"创建"| NCS2
+    NPSL -->|"读取配置"| NCP
+    NCR2 -->|"addListener()"| NCS2
+    NCR2 -->|"发布事件"| RS2["RefreshScope"]
+
+    NCS2 -->|"委托"| CW2
+    CW2 -->|"管理"| CD2
+    CW2 -->|"启动"| LP2
+    CW2 -->|"使用"| RPC2
+
+    RPC2 -->|"底层依赖"| GC2
+    GC2 -->|"注册"| CNH2
+
+    CD2 -->|"读写"| SNAP2
+    CNH2 -->|"回调"| CW2
+    CW2 -->|"触发"| CD2
+
+    CD2 -.->|"MD5变化时回调"| NCR2
+
+    style NPSL fill:#c8e6c9
+    style NCR2 fill:#c8e6c9
+    style NCP fill:#c8e6c9
+    style NCS2 fill:#bbdefb
+    style CW2 fill:#bbdefb
+    style CD2 fill:#bbdefb
+    style LP2 fill:#bbdefb
+    style RPC2 fill:#ffe0b2
+    style GC2 fill:#ffe0b2
+    style CNH2 fill:#ffe0b2
+    style SNAP2 fill:#f3e5f5
+    style RS2 fill:#ffcdd2
+```
+
+### 12.7 服务端类调用关系图
+
+```mermaid
+graph TD
+    subgraph "HTTP 入口"
+        CC3["ConfigController<br/>HTTP API"]
+    end
+
+    subgraph "gRPC 入口"
+        GA3["GrpcBiStreamRequestAcceptor<br/>gRPC Stream 接入"]
+        CM3["ConnectionManager<br/>连接管理"]
+    end
+
+    subgraph "请求处理"
+        CBLH3["ConfigChangeBatchListenRequestHandler<br/>批量监听注册"]
+        CQH3["ConfigQueryRequestHandler<br/>配置查询"]
+    end
+
+    subgraph "核心服务"
+        CCS3["ConfigCacheService<br/>内存缓存 + MD5计算"]
+        CLC3["ConfigChangeListenContext<br/>监听注册表<br/>groupKey ↔ connectionId"]
+        NC3["NotifyCenter<br/>事件总线"]
+    end
+
+    subgraph "Push 通知"
+        RCN3["RpcConfigChangeNotifier<br/>gRPC Push通知"]
+    end
+
+    subgraph "持久化"
+        DB3["ConfigInfoPersistService<br/>数据库持久化"]
+    end
+
+    CC3 -->|"publishConfig()"| DB3
+    CC3 -->|"dump()"| CCS3
+
+    GA3 -->|"创建连接"| CM3
+    GA3 -->|"分发请求"| CBLH3
+    GA3 -->|"分发请求"| CQH3
+
+    CBLH3 -->|"注册/注销监听"| CLC3
+    CBLH3 -->|"MD5比对"| CCS3
+
+    CQH3 -->|"查询配置"| CCS3
+
+    CCS3 -->|"持久化"| DB3
+    CCS3 -->|"发布ConfigDataChangeEvent"| NC3
+
+    NC3 -->|"通知"| RCN3
+    RCN3 -->|"查询监听连接"| CLC3
+    RCN3 -->|"通过Connection推送"| CM3
+
+    style CC3 fill:#ffcdd2
+    style GA3 fill:#ffe0b2
+    style CM3 fill:#ffe0b2
+    style CBLH3 fill:#c8e6c9
+    style CQH3 fill:#c8e6c9
+    style CCS3 fill:#bbdefb
+    style CLC3 fill:#bbdefb
+    style NC3 fill:#bbdefb
+    style RCN3 fill:#e1bee7
+    style DB3 fill:#f3e5f5
+```
+
+### 12.8 MD5 生命周期状态图
+
+```mermaid
+stateDiagram-v2
+    [*] --> NullState: CacheData 创建<br/>md5 = null
+
+    NullState --> PullingState: 发送 ConfigBatchListenRequest<br/>(md5=null, 服务端返回"已变更")
+
+    PullingState --> SyncedState: 发送 ConfigQueryRequest<br/>服务端返回 {content, md5="a1b2c3"}<br/>cacheData.setMd5("a1b2c3")
+
+    SyncedState --> ListeningState: 发送 ConfigBatchListenRequest<br/>(md5="a1b2c3", 服务端返回"未变更")
+
+    ListeningState --> NotifiedState: 收到 ConfigChangeNotifyRequest<br/>(服务端 Push)
+
+    NotifiedState --> PullingState: refreshContentAndCheck()<br/>发送 ConfigQueryRequest(tag=null)
+
+    ListeningState --> PullingState: LongPollingRunnable 兜底<br/>cacheData.isExpired() = true
+
+    note right of NullState
+        首次启动
+        本地无缓存
+    end note
+
+    note right of SyncedState
+        MD5 与服务端一致
+        配置未变更
+    end note
+
+    note right of ListeningState
+        正常监听状态
+        等待服务端 Push
+    end note
+
+    note right of NotifiedState
+        收到 Push 通知
+        需要拉取新配置
+    end note
+```
+
+### 12.9 配置变更端到端数据流
+
+```mermaid
+flowchart LR
+    subgraph A["1. 用户操作"]
+        A1["Nacos Console<br/>修改配置"]
+    end
+
+    subgraph B["2. 服务端处理"]
+        B1["ConfigController<br/>publishConfig()"]
+        B2["DB 持久化"]
+        B3["ConfigCacheService<br/>更新内存缓存<br/>重新计算MD5"]
+        B4["NotifyCenter<br/>发布事件"]
+    end
+
+    subgraph C["3. Push 通知"]
+        C1["RpcConfigChangeNotifier<br/>查找监听连接"]
+        C2["ConfigChangeListenContext<br/>groupKey→connectionIds"]
+        C3["gRPC Stream<br/>推送 ConfigChangeNotifyRequest"]
+    end
+
+    subgraph D["4. 客户端接收"]
+        D1["GrpcClient<br/>responseObserver.onNext()"]
+        D2["ConfigChangeNotifyRequestHandler<br/>标记不一致"]
+        D3["ClientWorker<br/>refreshContentAndCheck()"]
+    end
+
+    subgraph E["5. 拉取新配置"]
+        E1["ConfigQueryRequest<br/>(tag=null, 强制拉取)"]
+        E2["服务端返回<br/>ConfigQueryResponse"]
+        E3["CacheData<br/>setContent() + setMd5()"]
+    end
+
+    subgraph F["6. Spring 刷新"]
+        F1["CacheData<br/>checkListenerMd5()"]
+        F2["NacosContextRefresher<br/>更新PropertySource"]
+        F3["RefreshScope<br/>清空Bean缓存"]
+        F4["@RefreshScope Bean<br/>重新创建<br/>@Value 注入新值"]
+    end
+
+    A1 --> B1
+    B1 --> B2
+    B1 --> B3
+    B3 --> B4
+    B4 --> C1
+    C1 --> C2
+    C2 --> C3
+    C3 --> D1
+    D1 --> D2
+    D2 --> D3
+    D3 --> E1
+    E1 --> E2
+    E2 --> E3
+    E3 --> F1
+    F1 --> F2
+    F2 --> F3
+    F3 --> F4
+
+    style A fill:#e8f5e9
+    style B fill:#fff3e0
+    style C fill:#fce4ec
+    style D fill:#e3f2fd
+    style E fill:#f3e5f5
+    style F fill:#e0f2f1
+```
